@@ -67,6 +67,86 @@ const conditionFlags = enum(u16) {
     FL_NEG = (1 << 2), // (N)egative
 };
 
+// ---
+// That's all for hardware mocking!
+// ---
+
+// Traps
+//  *Trap routines* are routines for getting input from the keyboard and displaying strings to the console
+//  You can almost imagine these as an API for  the LC-3
+//  Each trap routine is assigned a _trap code_ which operates like an opcode
+//  When a trap routine is executed, we move the program counter to the routine's address and execute the procedure's instructions, then move the PC back to where it was before the routine
+//  Trap routines technically don't add any new functionality to our system, they just provide a convenient way to perform tasks
+const TrapCodes = enum(u16) {
+    GETC = 0x20, // Get char from keyboard, not echoed onto terminal
+    OUT = 0x21, // Output a char
+    PUTS = 0x22, // Output a word string
+    IN = 0x23, // Get char from keyboard, echoed onto terminal
+    PUTSP = 0x24, // Output a byte string
+    HALT = 0x25, // Halt the program
+};
+
+// Memory Mapped Registers
+//  These are special registers that are inaccessible from the normal register table
+//  Instead we reserve a special address for them in memory and read and rite only to their memory location
+//  We mostly use these to interact with special hardware devices (such as a keyboard)
+//  LC-3 has 2 MMRs we need to implement:
+//      - `KBSR`: Keyboard status register, indicates _whether_ a key has been pressed
+//      - `KBDR`: Keyboard sata register, idicates _which_ key was pressed
+//  We use these because they are non-blocking, they allow us to poll the state of the keyboard and continue execution
+//      - The other (RE: simpler) way to do this is to use the `GETC` trap code, but this block execution
+const MemoryMappedRegisters = enum(u16) {
+    KBSR = 0xFE00, // Keyboard status
+    KBDR = 0xFE02, // Keyboard data
+};
+
+fn memRead(addr: u16) u16 {
+    if (addr == MemoryMappedRegisters.KBSR) {
+        if (checkKey()) {
+            memory[MemoryMappedRegisters.KBSR] = (1 << 15);
+            memory[MemoryMappedRegisters.KBDR] = @as(u16, std.io.getStdIn().reader().readByte() catch {
+                return error.InputError;
+            });
+        } else {
+            memory[MemoryMappedRegisters.KBSR] = 0;
+        }
+    }
+    return memory[addr];
+}
+
+fn memWrite(address: u16, val: u16) void {
+    memory[address] = val;
+}
+
+// Helper functions
+fn disableInputBuffering() !void {
+    var original_tio: std.c.termios = try std.c.tcgetattr(std.c.STDIN_FILENO);
+    defer std.os.tcsetattr(std.os.posix.STDIN_FILENO, .FLUSH, &original_tio) catch {};
+
+    var new_tio = original_tio;
+    new_tio.lflag &= ~@as(u32, std.os.posix.ECHO | std.os.posix.ICANON);
+    try std.os.posix.tcsetattr(std.os.STDIN_FILENO, .FLUSH, &new_tio);
+}
+
+fn restoreInputBuffering() void {
+    var new_tio = undefined;
+    _ = std.os.posix.tcsetattr(std.os.STDIN_FILENO, .FLUSH, &new_tio);
+}
+
+fn checkKey() bool {
+    var readfds: std.os.fd_set = undefined;
+    std.os.FD_ZERO(&readfds);
+    std.os.FD_SET(std.os.STDIN_FILENO, &readfds);
+
+    var timeout = std.os.timeval{
+        .tv_sec = 0,
+        .tv_usec = 0,
+    };
+
+    _ = std.os.select(std.os.STDIN_FILENO + 1, &readfds, null, null, &timeout);
+    return std.os.FD_ISSET(std.os.STDIN_FILENO, &readfds);
+}
+
 // A note on Assembly:
 //  At the base of our VM we want to transform assembly (very low level human readable code) into 16-bit binary instructions the vm can understand
 //  This transformer is called an *assembler*, and the resultant instructions are called *machine code*
@@ -81,6 +161,10 @@ const conditionFlags = enum(u16) {
 //      4. Perform the instruction using the params in the instruction
 //      Repeat!
 
+fn swap16(x: u16) u16 {
+    return (x << 8) | (x >> 8);
+}
+
 fn handleCLArgs(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     while (args.next()) |arg| {
         switch (arg) {
@@ -93,32 +177,39 @@ fn handleCLArgs(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !v
                 ;
 
                 std.debug.print(help);
-                return std.os.exit(0);
+                std.process.exit(0);
             },
-            eql(u8, arg, "-i"), eql(u8, arg, "--image") => {
-                if (!args.next()) {
-                    const help =
-                        \\Usage: vm [options]
-                        \\ Options:
-                        \\     -h, --help  Display this help message
-                        \\     -i, --image  Load a program image
-                    ;
-                    std.debug.print(help);
-                    return std.os.exit(1);
-                }
-                const image = args.next().?;
-                const file = try std.fs.cwd().openFile(image, .{});
+            eql(u8, arg, "-i") or eql(u8, arg, "--image") => {
+                // Check if image path is provided
+                const image_path = args.next() orelse {
+                    std.log.err("Error: No image path provided\n", .{});
+                    return error.NoImagePath;
+                };
+
+                // Open the file
+                const file = try std.fs.cwd().openFile(image_path, .{});
                 defer file.close();
 
-                const fileSize = (try file.stat()).size;
+                // Read origin (first 2 bytes)
+                var origin_bytes: [2]u8 = undefined;
+                _ = try file.read(&origin_bytes);
+                const origin: u16 = std.mem.readInt(u16, &origin_bytes, .big);
 
-                if (fileSize > MEMORY_MAX) {
-                    std.log.err("Error: Program is too large to fit in memory", .{});
-                    return std.os.exit(1);
+                // Calculate maximum bytes we can read
+                // const max_read = MEMORY_MAX - origin;
+                const file_size = (try file.stat()).size;
+
+                // Read the rest of the file
+                var buffer = try allocator.alloc(u8, file_size - 2);
+                defer allocator.free(buffer);
+                _ = try file.read(buffer);
+
+                // Copy to memory and swap endianness
+                var i: usize = 0;
+                while (i < buffer.len - 1) : (i += 2) {
+                    const value = std.mem.readInt(u16, buffer[i..][0..2], .big);
+                    memory[origin + (i / 2)] = value;
                 }
-
-                const buffer = try file.readToEndAlloc(allocator, fileSize);
-                std.mem.copyForwards(u8, &memory, buffer, fileSize);
             },
             else => {
                 const help =
@@ -129,7 +220,7 @@ fn handleCLArgs(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !v
                 ;
 
                 std.debug.print(help);
-                return std.os.exit(1);
+                std.process.exit(1);
             },
         }
     }
@@ -153,11 +244,8 @@ fn updateFlags(r: u16) void {
     }
 }
 
-fn memRead(addr: u16) u16 {
-    return memory[addr];
-}
-
 pub fn main() !void {
+    try disableInputBuffering();
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
         const deinit_status = gpa.deinit();
@@ -178,7 +266,7 @@ pub fn main() !void {
     const PC_START = 0x3000;
     registerStorage[Registers.R_PC] = PC_START;
 
-    while (true) {
+    cpu: while (true) {
         // fetch instruction
         Registers.R_PC += 1;
         const instruct: u16 = registerStorage[Registers.R_PC];
@@ -385,16 +473,132 @@ pub fn main() !void {
                 // Update flags
                 updateFlags(r0);
             },
-            .OP_LEA => {},
-            .OP_ST => {},
-            .OP_STI => {},
-            .OP_STR => {},
-            .OP_TRAP => {},
-            .OP_RES => {},
-            .OP_RTI => {},
+            .OP_LEA => {
+                // LOAD EFFECTIVE ADDRESS
+
+                // Get destination register
+                const r0: u16 = (instruct >> 9) & 0x7;
+
+                // Get sign extended offset
+                const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
+
+                registerStorage[r0] = registerStorage[Registers.R_PC] + pcOffset;
+
+                updateFlags(r0);
+            },
+            .OP_ST => {
+                // STORE
+
+                // Get storage register
+                const sr: u16 = (instruct >> 9) & 0x7;
+
+                // Get PC offset
+                const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
+
+                memWrite(registerStorage[Registers.R_PC] + pcOffset, registerStorage[sr]);
+            },
+            .OP_STI => {
+                // STORE INDIRECT
+
+                // Get storage register
+                const sr: u16 = (instruct >> 9) & 0x7;
+
+                // Get PC offset
+                const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
+
+                memWrite(memRead(registerStorage[Registers.R_PC] + pcOffset), registerStorage[sr]);
+            },
+            .OP_STR => {
+                // STORE REGISTER
+
+                // Get storage register
+                const sr: u16 = (instruct >> 9) & 0x7;
+
+                // Get base register
+                const br: u16 = (instruct >> 6) & 0x7;
+
+                // Get memory offset
+                const offset: u16 = signExtend(instruct & 0x3F, 6);
+
+                memWrite(br + offset, registerStorage[sr]);
+            },
+            .OP_TRAP => {
+                // Store current PC in a register
+                registerStorage[Registers.R7] = registerStorage[Registers.R_PC];
+
+                // Get the trap code
+                const trapCode: TrapCodes = @enumFromInt(instruct & 0xFF);
+
+                // Switch on the trap code
+                switch (trapCode) {
+                    .GETC => {
+                        registerStorage[Registers.R0] = @as(u16, std.io.getStdIn().reader().readByte() catch {
+                            break error.InputError;
+                        });
+
+                        updateFlags(Registers.R0);
+                    },
+                    .OUT => {
+                        std.io.getStdOut().writer().writeByte(@as(u8, registerStorage[Registers.R0]) catch {
+                            break error.OutputError;
+                        });
+                    },
+                    .PUTS => {
+                        var address = registerStorage[Registers.R0];
+                        while (true) {
+                            const char = memRead(address);
+                            if (char == 0) {
+                                break;
+                            }
+                            std.io.getStdOut().writer().writeByte(@as(u8, char) catch {
+                                break error.OutputError;
+                            });
+                            address += 1;
+                        }
+                    },
+                    .IN => {
+                        const stdout = std.io.getStdOut().writer();
+                        const stdin = std.io.getStdIn().reader();
+
+                        try stdout.writeAll("Enter a character: ");
+
+                        // Read single character
+                        const c = try stdin.readByte();
+
+                        // Echo the character
+                        try stdout.writeByte(c);
+
+                        // Store in R0 and update flags
+                        registerStorage[Registers.R0] = @as(u16, c);
+                        updateFlags(Registers.R0);
+                    },
+                    .PUTSP => {
+                        const stdout = std.io.getStdOut().writer();
+
+                        const c: [*]u16 = @ptrCast(&memory[registerStorage[Registers.R0]]);
+
+                        var i: usize = 0;
+                        while (c[i] != 0) : (i += 1) {
+                            const char1: u8 = @truncate(c[i] & 0xFF);
+                            stdout.writeByte(char1) catch return;
+
+                            const char2: u8 = @truncate(c[i] >> 8);
+                            if (char2 != 0) {
+                                stdout.writeByte(char2) catch return;
+                            }
+                        }
+                    },
+                    .HALT => {
+                        std.log.err("HALT", .{});
+                        restoreInputBuffering();
+                        break :cpu;
+                    },
+                }
+            },
             else => {
                 // bad opcode
-                break;
+                restoreInputBuffering();
+                break :cpu;
             },
         }
     }
