@@ -1,20 +1,40 @@
-// This VM will simulate the LC-3, an educational computer architecture commonly used to teach university students computer architecture and assembly.
-// It has a simplified instruction set compared to x86, but demonstrates the main ideas used by modern CPUs.
-// [LC-3 ISA](https://en.wikipedia.org/wiki/Little_Computer_3)
-// The LC-3 has the following features:
-//  16 bit word size, 4 bit opcode, 12 bit param space
-//  [ 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 ]
-//   |OPCODE| |      PARAMETERS     |
-//  16 opcodes
-//  8 general purpose registers, 1 program counter, 1 condition flag register
-//  3 condition flags: P, Z, N
+// Intro
+//  This VM will simulate the LC-3, an educational computer architecture commonly used to teach university students computer architecture and assembly.
+//  It has a simplified instruction set compared to x86, but demonstrates the main ideas used by modern CPUs.
+//  [LC-3 ISA](https://en.wikipedia.org/wiki/Little_Computer_3)
+//  The LC-3 has the following features:
+//      - 16 bit word size, 4 bit opcode, 12 bit param space
+//      - [ 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 ]
+//         |OPCODE| |      PARAMETERS     |
+//      - 16 opcodes
+//      - 8 general purpose registers, 1 program counter, 1 condition flag register
+//      - 3 condition flags: P, Z, N
 
 const std = @import("std");
 const eql = std.mem.eql;
 
+const disableInputBuffering = @import("term.zig").disableInputBuffering;
+const setTermState = @import("term.zig").setTermState;
+
+// Register int shortcuts
+const R_COUNT = @intFromEnum(Registers.R_COUNT);
+const R_PC = @intFromEnum(Registers.R_PC);
+const R_COND = @intFromEnum(Registers.R_COND);
+const R0 = @intFromEnum(Registers.R0);
+const R1 = @intFromEnum(Registers.R1);
+const R2 = @intFromEnum(Registers.R2);
+const R3 = @intFromEnum(Registers.R3);
+const R4 = @intFromEnum(Registers.R4);
+const R5 = @intFromEnum(Registers.R5);
+const R6 = @intFromEnum(Registers.R6);
+const R7 = @intFromEnum(Registers.R7);
+
+const KBSR = @intFromEnum(MemoryMappedRegisters.KBSR);
+const KBDR = @intFromEnum(MemoryMappedRegisters.KBDR);
+
 // We use a simple array to represent memory
 const MEMORY_MAX = std.math.maxInt(u16);
-const memory: [MEMORY_MAX]u16 = undefined;
+var memory: [MEMORY_MAX]u16 = undefined;
 
 // Registers
 //  A register is a slot for storing a single value on the CPU
@@ -24,12 +44,12 @@ const memory: [MEMORY_MAX]u16 = undefined;
 //      1. Loading a value from memory into a register
 //      2. Calculating a value into another register
 //      3. Storing the final result back into memory
-//  The GP registers can be used to perform any prograam calulations
+//  The GP registers can be used to perform any program calulations
 //  The Program Counter is the address of the next instruction in memory to execute
 //  The Condition Flags tell us information about the previous calculation
-const Registers = enum(u16) { R0 = 0, R1 = 0, R2 = 0, R3 = 0, R4 = 0, R5 = 0, R6 = 0, R7 = 0, R_PC = 0, R_COND = 0, R_COUNT = 10 };
+const Registers = enum(u16) { R0 = 0, R1, R2, R3, R4, R5, R6, R7, R_PC, R_COND, R_COUNT = 10 };
 
-const registerStorage: [Registers.R_COUNT]u16 = undefined;
+var registerStorage: [R_COUNT]u16 = undefined;
 
 // Instruction Set
 //  An *instruction* is a command that tells the CPU to do some fundamental task
@@ -100,15 +120,15 @@ const MemoryMappedRegisters = enum(u16) {
     KBDR = 0xFE02, // Keyboard data
 };
 
-fn memRead(addr: u16) u16 {
-    if (addr == MemoryMappedRegisters.KBSR) {
+fn memRead(addr: u16) !u16 {
+    if (addr == KBSR) {
         if (checkKey()) {
-            memory[MemoryMappedRegisters.KBSR] = (1 << 15);
-            memory[MemoryMappedRegisters.KBDR] = @as(u16, std.io.getStdIn().reader().readByte() catch {
+            memory[KBSR] = (1 << 15);
+            memory[KBDR] = std.io.getStdIn().reader().readInt(u16, .big) catch {
                 return error.InputError;
-            });
+            };
         } else {
-            memory[MemoryMappedRegisters.KBSR] = 0;
+            memory[KBSR] = 0;
         }
     }
     return memory[addr];
@@ -119,32 +139,21 @@ fn memWrite(address: u16, val: u16) void {
 }
 
 // Helper functions
-fn disableInputBuffering() !void {
-    var original_tio: std.c.termios = try std.c.tcgetattr(std.c.STDIN_FILENO);
-    defer std.os.tcsetattr(std.os.posix.STDIN_FILENO, .FLUSH, &original_tio) catch {};
-
-    var new_tio = original_tio;
-    new_tio.lflag &= ~@as(u32, std.os.posix.ECHO | std.os.posix.ICANON);
-    try std.os.posix.tcsetattr(std.os.STDIN_FILENO, .FLUSH, &new_tio);
-}
-
 fn restoreInputBuffering() void {
-    var new_tio = undefined;
-    _ = std.os.posix.tcsetattr(std.os.STDIN_FILENO, .FLUSH, &new_tio);
+    var new_tio: std.c.termios = undefined;
+    _ = std.c.tcsetattr(std.c.STDIN_FILENO, .FLUSH, &new_tio);
 }
 
 fn checkKey() bool {
-    var readfds: std.os.fd_set = undefined;
-    std.os.FD_ZERO(&readfds);
-    std.os.FD_SET(std.os.STDIN_FILENO, &readfds);
-
-    var timeout = std.os.timeval{
-        .tv_sec = 0,
-        .tv_usec = 0,
+    var fds = [_]std.os.linux.pollfd{
+        .{
+            .fd = std.io.getStdIn().handle,
+            .events = std.os.linux.POLL.IN,
+            .revents = 0,
+        },
     };
-
-    _ = std.os.select(std.os.STDIN_FILENO + 1, &readfds, null, null, &timeout);
-    return std.os.FD_ISSET(std.os.STDIN_FILENO, &readfds);
+    const ret = std.os.linux.poll(&fds, 1, 0); // 0ms timeout, non-blocking
+    return (ret > 0) and (fds[0].revents & std.os.linux.POLL.IN != 0);
 }
 
 // A note on Assembly:
@@ -167,85 +176,81 @@ fn swap16(x: u16) u16 {
 
 fn handleCLArgs(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     while (args.next()) |arg| {
-        switch (arg) {
-            eql(u8, arg, "-h"), eql(u8, arg, "--help") => {
-                const help =
-                    \\Usage: vm [options]
-                    \\ Options:
-                    \\     -h, --help  Display this help message
-                    \\     -i, --image  Load a program image
-                ;
+        if (eql(u8, arg, "-h") or eql(u8, arg, "--help")) {
+            const help =
+                \\Usage: vm [options]
+                \\ Options:
+                \\     -h, --help  Display this help message
+                \\     -i, --image  Load a program image
+            ;
 
-                std.debug.print(help);
-                std.process.exit(0);
-            },
-            eql(u8, arg, "-i") or eql(u8, arg, "--image") => {
-                // Check if image path is provided
-                const image_path = args.next() orelse {
-                    std.log.err("Error: No image path provided\n", .{});
-                    return error.NoImagePath;
-                };
+            std.debug.print(help, .{});
+            std.process.exit(0);
+        } else if (eql(u8, arg, "-i") or eql(u8, arg, "--image")) {
+            // Check if image path is provided
+            const image_path = args.next() orelse {
+                std.log.err("Error: No image path provided\n", .{});
+                return error.NoImagePath;
+            };
 
-                // Open the file
-                const file = try std.fs.cwd().openFile(image_path, .{});
-                defer file.close();
+            // Open the file
+            const file = try std.fs.cwd().openFile(image_path, .{});
+            defer file.close();
 
-                // Read origin (first 2 bytes)
-                var origin_bytes: [2]u8 = undefined;
-                _ = try file.read(&origin_bytes);
-                const origin: u16 = std.mem.readInt(u16, &origin_bytes, .big);
+            // Read origin (first 2 bytes)
+            var origin_bytes: [2]u8 = undefined;
+            _ = try file.read(&origin_bytes);
+            const origin: u16 = std.mem.readInt(u16, &origin_bytes, .big);
 
-                // Calculate maximum bytes we can read
-                // const max_read = MEMORY_MAX - origin;
-                const file_size = (try file.stat()).size;
+            // Calculate maximum bytes we can read
+            // const max_read = MEMORY_MAX - origin;
+            const file_size = (try file.stat()).size;
 
-                // Read the rest of the file
-                var buffer = try allocator.alloc(u8, file_size - 2);
-                defer allocator.free(buffer);
-                _ = try file.read(buffer);
+            // Read the rest of the file
+            var buffer = try allocator.alloc(u8, file_size - 2);
+            defer allocator.free(buffer);
+            _ = try file.read(buffer);
 
-                // Copy to memory and swap endianness
-                var i: usize = 0;
-                while (i < buffer.len - 1) : (i += 2) {
-                    const value = std.mem.readInt(u16, buffer[i..][0..2], .big);
-                    memory[origin + (i / 2)] = value;
-                }
-            },
-            else => {
-                const help =
-                    \\Usage: vm [options]
-                    \\ Options:
-                    \\     -h, --help  Display this help message
-                    \\     -i, --image  Load a program image
-                ;
+            // Copy to memory and swap endianness
+            // TODO: figure out how to do this without a loop
+            var i: usize = 0;
+            while (i < buffer.len - 1) : (i += 2) {
+                const value = std.mem.readInt(u16, buffer[i..][0..2], .big);
+                memory[origin + (i / 2)] = value;
+            }
+        } else {
+            const help =
+                \\Usage: vm [options]
+                \\ Options:
+                \\     -h, --help  Display this help message
+                \\     -i, --image  Load a program image
+            ;
 
-                std.debug.print(help);
-                std.process.exit(1);
-            },
+            std.debug.print(help, .{});
+            std.process.exit(1);
         }
     }
 }
 
 // NOTE: Realistically this could just be a stdlib function
-fn signExtend(x: u16, bitCount: u32) u16 {
-    if ((x >> (bitCount - 1)) & 1) {
-        x |= 0xFFFF << bitCount;
+fn signExtend(x: u16, comptime bitCount: u4) u16 {
+    if (((x >> (bitCount - 1)) & 1) == 1) {
+        x |= 0xFFFF <<| bitCount;
     }
     return x;
 }
 
 fn updateFlags(r: u16) void {
     if (registerStorage[r] == 0) {
-        registerStorage[Registers.R_COND] = conditionFlags.FL_ZRO;
-    } else if (registerStorage[r] >> 15) {
-        registerStorage[Registers.R_COND] = conditionFlags.FL_NEG;
+        registerStorage[R_COND] = @intFromEnum(conditionFlags.FL_ZRO);
+    } else if ((registerStorage[r] >> 15) == 1) {
+        registerStorage[R_COND] = @intFromEnum(conditionFlags.FL_NEG);
     } else {
-        registerStorage[Registers.R_COND] = conditionFlags.FL_POS;
+        registerStorage[R_COND] = @intFromEnum(conditionFlags.FL_POS);
     }
 }
 
 pub fn main() !void {
-    try disableInputBuffering();
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
         const deinit_status = gpa.deinit();
@@ -259,17 +264,21 @@ pub fn main() !void {
 
     try handleCLArgs(&args, gpa.allocator());
 
+    const original_state = try disableInputBuffering(gpa.allocator());
+    defer setTermState(original_state, gpa.allocator());
+
     // We need to have 1 condition flag set at any given time, so we set the Z flag
-    registerStorage[Registers.R_COND] = conditionFlags.FL_ZRO;
+    registerStorage[R_COND] = @intFromEnum(conditionFlags.FL_ZRO);
 
     // Set the PC to the starting position
     const PC_START = 0x3000;
-    registerStorage[Registers.R_PC] = PC_START;
+    registerStorage[R_PC] = PC_START;
 
+    // TODO for some reason this needs a try? figure out why
     cpu: while (true) {
         // fetch instruction
-        Registers.R_PC += 1;
-        const instruct: u16 = registerStorage[Registers.R_PC];
+        registerStorage[R_PC] += 1;
+        const instruct: u16 = registerStorage[R_PC];
         const op: Opcodes = @enumFromInt(instruct >> 12);
 
         // Switch on the opcode
@@ -305,7 +314,7 @@ pub fn main() !void {
                 // Check for immediate mode
                 const immFlag: u16 = (instruct >> 5) & 0x1;
 
-                if (immFlag) {
+                if (immFlag == 1) {
                     const imm5: u16 = signExtend(instruct & 0x1F, 5);
                     registerStorage[r0] = registerStorage[r1] + imm5;
                 } else {
@@ -330,7 +339,7 @@ pub fn main() !void {
                 // Check for immediate mode
                 const immFlag: u16 = (instruct >> 5) & 0x1;
 
-                if (immFlag) {
+                if (immFlag == 1) {
                     const imm5: u16 = signExtend(instruct & 0x1F, 5);
                     registerStorage[r0] = registerStorage[r1] & imm5;
                 } else {
@@ -362,6 +371,10 @@ pub fn main() !void {
             .OP_BR => {
                 // CONDITIONAL BRANCH
                 //  If the condition flag in the flag register matches the condition flag in the encoding, jump to the address (PC + offset) and execute that instruction
+                //  Encoding:
+                //      - Opcode (4 bits, should be `0000`)
+                //      - Condition flags (3 bits) - n, z, p flags that determine when to branch
+                //      - PCoffset9 (9 bits) - Signed offset from the current PC
 
                 // Get program counter offset
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
@@ -369,40 +382,48 @@ pub fn main() !void {
                 // Get condition flag
                 const condFlag: u16 = (instruct >> 9) & 0x7;
 
-                if (condFlag & registerStorage[Registers.R_COND]) {
-                    registerStorage[Registers.R_PC] += pcOffset;
+                if ((condFlag & registerStorage[R_COND]) != 0) {
+                    registerStorage[R_PC] += pcOffset;
                 }
             },
             .OP_JMP => {
                 // JUMP
+                //  Unconditionally jumps to the address stored in the base register
+                //  Encoding:
+                //      - Opcode (4 bits, should be `1100`)
+                //      - Unused (3 bits)
+                //      - Base register (3 bits) - Contains the address to jump to
+                //      - Unused (6 bits)
 
                 // Get destination register
                 const r1: u16 = (instruct >> 6) & 0x7;
 
-                registerStorage[Registers.R_PC] = registerStorage[r1];
+                registerStorage[R_PC] = registerStorage[r1];
             },
             .OP_JSR => {
                 // JUMP REGISTER
-                //  Jumps to a location in memory
+                //  Jumps to a location in memory and saves return address
                 //  Encoding:
                 //      - opcode (4 bits, should be `0100`)
-                //      - long flag (1 bit)
-                //      - PCoffset 11 (11 bits)
+                //      - long flag (1 bit) - Determines if using JSR (1) or JSRR (0) mode
+                //      - If JSR: PCoffset11 (11 bits) - Signed offset from current PC
+                //      - If JSRR: unused (2 bits), BaseR (3 bits), unused (6 bits)
+                //  Always saves the incremented PC in R7 before jumping
 
                 // Check whether we're in long or short mode
                 const longFlag = (instruct >> 11) & 1;
 
                 // Save the address of the call routine in register 7
-                registerStorage[Registers.R7] = registerStorage[Registers.R_PC];
+                registerStorage[R7] = registerStorage[R_PC];
 
-                if (longFlag) {
+                if (longFlag == 1) {
                     // JSR case
                     const longPcOffset: u16 = signExtend(instruct & 0x1FF, 11);
-                    registerStorage[Registers.R_PC] += longPcOffset;
+                    registerStorage[R_PC] += longPcOffset;
                 } else {
                     // JSRR case
                     const r1: u16 = (instruct >> 6) & 0x7;
-                    registerStorage[Registers.R_PC] += registerStorage[r1];
+                    registerStorage[R_PC] += registerStorage[r1];
                 }
             },
             .OP_LD => {
@@ -411,7 +432,7 @@ pub fn main() !void {
                 //  Encoding:
                 //      - opcode (4 bits, should be `0010`)
                 //      - destination register (3 bits)
-                //      - PCoffset --> An offset that gets added to the PC register, which points to an address
+                //      - PCoffset9 (9 bits) - Signed offset added to the current PC to get memory address
 
                 // Get destination register
                 const r0: u16 = (instruct >> 9) & 0x7;
@@ -419,7 +440,7 @@ pub fn main() !void {
                 // Get PC Offset
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
-                registerStorage[r0] = memRead(registerStorage[Registers.R_PC] + pcOffset);
+                registerStorage[r0] = try memRead(registerStorage[R_PC] + pcOffset);
 
                 updateFlags(r0);
             },
@@ -429,7 +450,7 @@ pub fn main() !void {
                 //  Encoding:
                 //      - opcode (4 bits, should be `0101`)
                 //      - destination register (3 bits)
-                //      - PCoffset --> An offset that gets added to the PC register, which points to an address, and that address contains the address which should get loaded into memory
+                //      - PCoffset9 (9 bits) - Points to address containing final target address
                 //  We also need to sign-extend the PCoffset to make it a valid memory address
                 //  This may seem roundabout, considering the LD instruction exists, but it is incredibly useful
                 //  LD is limited to offsets that are 9 bits, but our memory needs 16 bit addresses
@@ -443,7 +464,7 @@ pub fn main() !void {
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
                 // Add PCoffset to the current PC, look into that mem location to get the final address
-                registerStorage[r0] = memRead(memRead(registerStorage[Registers.R_PC] + pcOffset));
+                registerStorage[r0] = try memRead(try memRead(registerStorage[R_PC] + pcOffset));
 
                 // Update flags
                 updateFlags(r0);
@@ -455,7 +476,7 @@ pub fn main() !void {
                 //      - opcode (4 bits, should be `0110`)
                 //      - destination register (3 bits)
                 //      - base register (3 bits)
-                //      - offset (6 bits)
+                //      - offset6 (6 bits) - Signed offset added to base register value
                 //  The offset is added to the base register to get the final address to load from
                 //  This is useful for loading data that's stored in a neighborhood of the base register
 
@@ -468,13 +489,19 @@ pub fn main() !void {
                 // Get offset
                 const offset: u16 = signExtend(instruct & 0x3F, 6);
 
-                registerStorage[r0] = memRead(registerStorage[r1] + offset);
+                registerStorage[r0] = try memRead(registerStorage[r1] + offset);
 
                 // Update flags
                 updateFlags(r0);
             },
             .OP_LEA => {
                 // LOAD EFFECTIVE ADDRESS
+                //  Loads the address of a memory location into a register
+                //  Encoding:
+                //      - opcode (4 bits, should be `1110`)
+                //      - destination register (3 bits)
+                //      - PCoffset9 (9 bits) - Signed offset from current PC
+                //  Unlike other loads, this loads the address itself rather than the value at that address
 
                 // Get destination register
                 const r0: u16 = (instruct >> 9) & 0x7;
@@ -482,12 +509,17 @@ pub fn main() !void {
                 // Get sign extended offset
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
-                registerStorage[r0] = registerStorage[Registers.R_PC] + pcOffset;
+                registerStorage[r0] = registerStorage[R_PC] + pcOffset;
 
                 updateFlags(r0);
             },
             .OP_ST => {
                 // STORE
+                //  Stores a register value into memory
+                //  Encoding:
+                //      - opcode (4 bits, should be `0011`)
+                //      - source register (3 bits) - Register containing value to store
+                //      - PCoffset9 (9 bits) - Signed offset from current PC for target address
 
                 // Get storage register
                 const sr: u16 = (instruct >> 9) & 0x7;
@@ -495,10 +527,16 @@ pub fn main() !void {
                 // Get PC offset
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
-                memWrite(registerStorage[Registers.R_PC] + pcOffset, registerStorage[sr]);
+                memWrite(registerStorage[R_PC] + pcOffset, registerStorage[sr]);
             },
             .OP_STI => {
                 // STORE INDIRECT
+                //  Stores a register value into memory using indirect addressing
+                //  Encoding:
+                //      - opcode (4 bits, should be `1011`)
+                //      - source register (3 bits) - Register containing value to store
+                //      - PCoffset9 (9 bits) - Points to address containing final target address
+                //  Similar to LDI, allows storing to addresses further than 9-bit offset would allow
 
                 // Get storage register
                 const sr: u16 = (instruct >> 9) & 0x7;
@@ -506,10 +544,16 @@ pub fn main() !void {
                 // Get PC offset
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
-                memWrite(memRead(registerStorage[Registers.R_PC] + pcOffset), registerStorage[sr]);
+                memWrite(try memRead(registerStorage[R_PC] + pcOffset), registerStorage[sr]);
             },
             .OP_STR => {
                 // STORE REGISTER
+                //  Stores a register value into memory using base+offset addressing
+                //  Encoding:
+                //      - opcode (4 bits, should be `0111`)
+                //      - source register (3 bits) - Register containing value to store
+                //      - base register (3 bits) - Contains base address
+                //      - offset6 (6 bits) - Signed offset added to base register value
 
                 // Get storage register
                 const sr: u16 = (instruct >> 9) & 0x7;
@@ -523,8 +567,23 @@ pub fn main() !void {
                 memWrite(br + offset, registerStorage[sr]);
             },
             .OP_TRAP => {
+                // TRAP
+                //  System call that performs various I/O and control operations
+                //  Encoding:
+                //      - opcode (4 bits, should be `1111`)
+                //      - unused (4 bits)
+                //      - trapvect8 (8 bits) - Index into trap vector table
+                //  Saves current PC in R7 before executing trap routine
+                //  Different trap codes perform different operations like:
+                //      - GETC: Read character from keyboard
+                //      - OUT: Output character
+                //      - PUTS: Output string
+                //      - IN: Input character with prompt
+                //      - PUTSP: Output byte string
+                //      - HALT: Halt program execution
+
                 // Store current PC in a register
-                registerStorage[Registers.R7] = registerStorage[Registers.R_PC];
+                registerStorage[R7] = registerStorage[R_PC];
 
                 // Get the trap code
                 const trapCode: TrapCodes = @enumFromInt(instruct & 0xFF);
@@ -532,27 +591,24 @@ pub fn main() !void {
                 // Switch on the trap code
                 switch (trapCode) {
                     .GETC => {
-                        registerStorage[Registers.R0] = @as(u16, std.io.getStdIn().reader().readByte() catch {
+                        registerStorage[R0] = @as(u16, std.io.getStdIn().reader().readInt(u16, .big) catch {
                             break error.InputError;
                         });
 
-                        updateFlags(Registers.R0);
+                        updateFlags(R0);
                     },
                     .OUT => {
-                        std.io.getStdOut().writer().writeByte(@as(u8, registerStorage[Registers.R0]) catch {
+                        std.io.getStdOut().writer().writeInt(u16, registerStorage[R0], .big) catch {
                             break error.OutputError;
-                        });
+                        };
                     },
                     .PUTS => {
-                        var address = registerStorage[Registers.R0];
-                        while (true) {
-                            const char = memRead(address);
-                            if (char == 0) {
-                                break;
-                            }
-                            std.io.getStdOut().writer().writeByte(@as(u8, char) catch {
-                                break error.OutputError;
-                            });
+                        var address = registerStorage[R0];
+                        var char: u16 = undefined;
+                        while (char != 0) {
+                            char = try memRead(address);
+
+                            try std.io.getStdOut().writer().writeInt(u16, char, .big);
                             address += 1;
                         }
                     },
@@ -569,13 +625,13 @@ pub fn main() !void {
                         try stdout.writeByte(c);
 
                         // Store in R0 and update flags
-                        registerStorage[Registers.R0] = @as(u16, c);
-                        updateFlags(Registers.R0);
+                        registerStorage[R0] = @as(u16, c);
+                        updateFlags(R0);
                     },
                     .PUTSP => {
                         const stdout = std.io.getStdOut().writer();
 
-                        const c: [*]u16 = @ptrCast(&memory[registerStorage[Registers.R0]]);
+                        const c: [*]u16 = @ptrCast(&memory[registerStorage[R0]]);
 
                         var i: usize = 0;
                         while (c[i] != 0) : (i += 1) {
