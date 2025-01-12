@@ -13,8 +13,9 @@
 const std = @import("std");
 const eql = std.mem.eql;
 
-const disableInputBuffering = @import("term.zig").disableInputBuffering;
-const setTermState = @import("term.zig").setTermState;
+extern fn disable_input_buffering() c_int;
+extern fn restore_input_buffering() void;
+extern fn check_key() bool;
 
 // Register int shortcuts
 const R_COUNT = @intFromEnum(Registers.R_COUNT);
@@ -38,7 +39,7 @@ var memory: [MEMORY_MAX]u16 = undefined;
 
 // Registers
 //  A register is a slot for storing a single value on the CPU
-//  If we want to ork with a piece of data, we need to load it into a register first
+//  If we want to work with a piece of data, we need to load it into a register first
 //  A small number of registers --> only a minimal number of values can be stored at once
 //  We can get around this by:
 //      1. Loading a value from memory into a register
@@ -122,7 +123,7 @@ const MemoryMappedRegisters = enum(u16) {
 
 fn memRead(addr: u16) !u16 {
     if (addr == KBSR) {
-        if (checkKey()) {
+        if (check_key()) {
             memory[KBSR] = (1 << 15);
             memory[KBDR] = std.io.getStdIn().reader().readInt(u16, .big) catch {
                 return error.InputError;
@@ -136,24 +137,6 @@ fn memRead(addr: u16) !u16 {
 
 fn memWrite(address: u16, val: u16) void {
     memory[address] = val;
-}
-
-// Helper functions
-fn restoreInputBuffering() void {
-    var new_tio: std.c.termios = undefined;
-    _ = std.c.tcsetattr(std.c.STDIN_FILENO, .FLUSH, &new_tio);
-}
-
-fn checkKey() bool {
-    var fds = [_]std.os.linux.pollfd{
-        .{
-            .fd = std.io.getStdIn().handle,
-            .events = std.os.linux.POLL.IN,
-            .revents = 0,
-        },
-    };
-    const ret = std.os.linux.poll(&fds, 1, 0); // 0ms timeout, non-blocking
-    return (ret > 0) and (fds[0].revents & std.os.linux.POLL.IN != 0);
 }
 
 // A note on Assembly:
@@ -264,8 +247,8 @@ pub fn main() !void {
 
     try handleCLArgs(&args, gpa.allocator());
 
-    const original_state = try disableInputBuffering(gpa.allocator());
-    defer setTermState(original_state, gpa.allocator());
+    _ = disable_input_buffering();
+    defer restore_input_buffering();
 
     // We need to have 1 condition flag set at any given time, so we set the Z flag
     registerStorage[R_COND] = @intFromEnum(conditionFlags.FL_ZRO);
@@ -646,14 +629,12 @@ pub fn main() !void {
                     },
                     .HALT => {
                         std.log.err("HALT", .{});
-                        restoreInputBuffering();
                         break :cpu;
                     },
                 }
             },
             else => {
                 // bad opcode
-                restoreInputBuffering();
                 break :cpu;
             },
         }
