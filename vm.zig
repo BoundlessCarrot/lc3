@@ -218,7 +218,7 @@ fn handleCLArgs(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !v
 // NOTE: Realistically this could just be a stdlib function
 fn signExtend(x: u16, comptime bitCount: u4) u16 {
     if (((x >> (bitCount - 1)) & 1) == 1) {
-        x |= 0xFFFF <<| bitCount;
+        return x | (@as(u16, 0xFFFF) << bitCount);
     }
     return x;
 }
@@ -258,7 +258,7 @@ pub fn main() !void {
     registerStorage[R_PC] = PC_START;
 
     // TODO for some reason this needs a try? figure out why
-    cpu: while (true) {
+    try cpu: while (true) {
         // fetch instruction
         registerStorage[R_PC] += 1;
         const instruct: u16 = registerStorage[R_PC];
@@ -638,5 +638,5 @@ pub fn main() !void {
                 break :cpu;
             },
         }
-    }
+    };
 }
