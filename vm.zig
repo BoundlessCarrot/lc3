@@ -136,6 +136,11 @@ fn memRead(addr: u16) !u16 {
 }
 
 fn memWrite(address: u16, val: u16) void {
+    // Check if address is valid
+    if (address == MEMORY_MAX) {
+        std.debug.print("Warning: Attempted to write to max memory address 0x{x}\n", .{address});
+        return;
+    }
     memory[address] = val;
 }
 
@@ -260,9 +265,11 @@ pub fn main() !void {
     // TODO for some reason this needs a try? figure out why
     try cpu: while (true) {
         // fetch instruction
-        registerStorage[R_PC] += 1;
-        const instruct: u16 = registerStorage[R_PC];
+        const instruct: u16 = try memRead(registerStorage[R_PC]);
         const op: Opcodes = @enumFromInt(instruct >> 12);
+
+        // Fix: Use wrapping addition to prevent overflow
+        registerStorage[R_PC] = @addWithOverflow(registerStorage[R_PC], 1)[0];
 
         // Switch on the opcode
         switch (op) {
@@ -299,10 +306,12 @@ pub fn main() !void {
 
                 if (immFlag == 1) {
                     const imm5: u16 = signExtend(instruct & 0x1F, 5);
-                    registerStorage[r0] = registerStorage[r1] + imm5;
+                    // Fix: Use wrapping addition to prevent overflow
+                    registerStorage[r0] = @addWithOverflow(registerStorage[r1], imm5)[0];
                 } else {
                     const r2: u16 = instruct & 0x7;
-                    registerStorage[r0] = registerStorage[r1] + registerStorage[r2];
+                    // Fix: Use wrapping addition to prevent overflow
+                    registerStorage[r0] = @addWithOverflow(registerStorage[r1], registerStorage[r2])[0];
                 }
 
                 updateFlags(r0);
@@ -366,7 +375,8 @@ pub fn main() !void {
                 const condFlag: u16 = (instruct >> 9) & 0x7;
 
                 if ((condFlag & registerStorage[R_COND]) != 0) {
-                    registerStorage[R_PC] += pcOffset;
+                    // Fix: Use wrapping addition to prevent overflow
+                    registerStorage[R_PC] = @addWithOverflow(registerStorage[R_PC], pcOffset)[0];
                 }
             },
             .OP_JMP => {
@@ -402,11 +412,13 @@ pub fn main() !void {
                 if (longFlag == 1) {
                     // JSR case
                     const longPcOffset: u16 = signExtend(instruct & 0x1FF, 11);
-                    registerStorage[R_PC] += longPcOffset;
+                    // Fix: Use wrapping addition to prevent overflow
+                    registerStorage[R_PC] = @addWithOverflow(registerStorage[R_PC], longPcOffset)[0];
                 } else {
                     // JSRR case
                     const r1: u16 = (instruct >> 6) & 0x7;
-                    registerStorage[R_PC] += registerStorage[r1];
+                    // Fix: Use wrapping addition to prevent overflow
+                    registerStorage[R_PC] = @addWithOverflow(registerStorage[R_PC], registerStorage[r1])[0];
                 }
             },
             .OP_LD => {
@@ -423,7 +435,9 @@ pub fn main() !void {
                 // Get PC Offset
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
-                registerStorage[r0] = try memRead(registerStorage[R_PC] + pcOffset);
+                // Fix: Use wrapping addition to prevent overflow
+                const addr = @addWithOverflow(registerStorage[R_PC], pcOffset)[0];
+                registerStorage[r0] = try memRead(addr);
 
                 updateFlags(r0);
             },
@@ -446,8 +460,10 @@ pub fn main() !void {
                 // Get PCoffset 9
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
+                // Fix: Use wrapping addition to prevent overflow
+                const addr = @addWithOverflow(registerStorage[R_PC], pcOffset)[0];
                 // Add PCoffset to the current PC, look into that mem location to get the final address
-                registerStorage[r0] = try memRead(try memRead(registerStorage[R_PC] + pcOffset));
+                registerStorage[r0] = try memRead(try memRead(addr));
 
                 // Update flags
                 updateFlags(r0);
@@ -472,7 +488,9 @@ pub fn main() !void {
                 // Get offset
                 const offset: u16 = signExtend(instruct & 0x3F, 6);
 
-                registerStorage[r0] = try memRead(registerStorage[r1] + offset);
+                // Fix: Use wrapping addition to prevent overflow
+                const addr = @addWithOverflow(registerStorage[r1], offset)[0];
+                registerStorage[r0] = try memRead(addr);
 
                 // Update flags
                 updateFlags(r0);
@@ -492,7 +510,8 @@ pub fn main() !void {
                 // Get sign extended offset
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
-                registerStorage[r0] = registerStorage[R_PC] + pcOffset;
+                // Fix: Use wrapping addition to prevent overflow
+                registerStorage[r0] = @addWithOverflow(registerStorage[R_PC], pcOffset)[0];
 
                 updateFlags(r0);
             },
@@ -510,7 +529,9 @@ pub fn main() !void {
                 // Get PC offset
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
-                memWrite(registerStorage[R_PC] + pcOffset, registerStorage[sr]);
+                // Fix: Use wrapping addition to prevent overflow
+                const addr = @addWithOverflow(registerStorage[R_PC], pcOffset)[0];
+                memWrite(addr, registerStorage[sr]);
             },
             .OP_STI => {
                 // STORE INDIRECT
@@ -527,7 +548,9 @@ pub fn main() !void {
                 // Get PC offset
                 const pcOffset: u16 = signExtend(instruct & 0x1FF, 9);
 
-                memWrite(try memRead(registerStorage[R_PC] + pcOffset), registerStorage[sr]);
+                // Fix: Use wrapping addition to prevent overflow
+                const addr = @addWithOverflow(registerStorage[R_PC], pcOffset)[0];
+                memWrite(try memRead(addr), registerStorage[sr]);
             },
             .OP_STR => {
                 // STORE REGISTER
@@ -547,7 +570,9 @@ pub fn main() !void {
                 // Get memory offset
                 const offset: u16 = signExtend(instruct & 0x3F, 6);
 
-                memWrite(br + offset, registerStorage[sr]);
+                // Fix: Use wrapping addition to prevent overflow
+                const addr = @addWithOverflow(registerStorage[br], offset)[0];
+                memWrite(addr, registerStorage[sr]);
             },
             .OP_TRAP => {
                 // TRAP
@@ -574,25 +599,28 @@ pub fn main() !void {
                 // Switch on the trap code
                 switch (trapCode) {
                     .GETC => {
-                        registerStorage[R0] = @as(u16, std.io.getStdIn().reader().readInt(u16, .big) catch {
+                        const stdin = std.io.getStdIn().reader();
+                        const c = stdin.readByte() catch {
                             break error.InputError;
-                        });
-
+                        };
+                        registerStorage[R0] = c;
                         updateFlags(R0);
                     },
                     .OUT => {
-                        std.io.getStdOut().writer().writeInt(u16, registerStorage[R0], .big) catch {
+                        const c: u8 = @truncate(registerStorage[R0]);
+                        std.io.getStdOut().writer().writeByte(c) catch {
                             break error.OutputError;
                         };
                     },
                     .PUTS => {
                         var address = registerStorage[R0];
-                        var char: u16 = undefined;
+                        var char: u16 = try memRead(address);
                         while (char != 0) {
+                            const c: u8 = @truncate(char);
+                            try std.io.getStdOut().writer().writeByte(c);
+                            // Fix: Use wrapping addition to prevent overflow
+                            address = @addWithOverflow(address, 1)[0];
                             char = try memRead(address);
-
-                            try std.io.getStdOut().writer().writeInt(u16, char, .big);
-                            address += 1;
                         }
                     },
                     .IN => {
@@ -602,29 +630,35 @@ pub fn main() !void {
                         try stdout.writeAll("Enter a character: ");
 
                         // Read single character
-                        const c = try stdin.readByte();
+                        const c = stdin.readByte() catch {
+                            break error.InputError;
+                        };
 
                         // Echo the character
                         try stdout.writeByte(c);
+                        try stdout.writeByte('\n');
 
                         // Store in R0 and update flags
-                        registerStorage[R0] = @as(u16, c);
+                        registerStorage[R0] = c;
                         updateFlags(R0);
                     },
                     .PUTSP => {
                         const stdout = std.io.getStdOut().writer();
+                        var address = registerStorage[R0];
+                        var value: u16 = try memRead(address);
 
-                        const c: [*]u16 = @ptrCast(&memory[registerStorage[R0]]);
-
-                        var i: usize = 0;
-                        while (c[i] != 0) : (i += 1) {
-                            const char1: u8 = @truncate(c[i] & 0xFF);
+                        while (value != 0) {
+                            const char1: u8 = @truncate(value & 0xFF);
                             stdout.writeByte(char1) catch return;
 
-                            const char2: u8 = @truncate(c[i] >> 8);
+                            const char2: u8 = @truncate(value >> 8);
                             if (char2 != 0) {
                                 stdout.writeByte(char2) catch return;
                             }
+
+                            // Fix: Use wrapping addition to prevent overflow
+                            address = @addWithOverflow(address, 1)[0];
+                            value = try memRead(address);
                         }
                     },
                     .HALT => {
