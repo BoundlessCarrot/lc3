@@ -13,6 +13,26 @@
 const std = @import("std");
 const eql = std.mem.eql;
 
+// C Function Bindings
+//  Our VM needs to interact with the terminal for input/output operations
+//  We use these external C functions to handle terminal input properly:
+//
+//  disable_input_buffering:
+//    - Puts the terminal in "raw" mode where keypresses are immediately available
+//    - Without this, input would only be sent after pressing Enter
+//    - Returns an integer status code (0 for success)
+//
+//  restore_input_buffering:
+//    - Restores the terminal to its normal "cooked" mode after program execution
+//    - This ensures the terminal behaves normally after our program exits
+//
+//  check_key:
+//    - Checks if a key has been pressed without blocking
+//    - Returns true if a key is available to be read
+//    - Allows our program to poll for keyboard input without halting execution
+//
+//  These functions are crucial for implementing proper keyboard handling in our VM,
+//  especially for trap routines that need to read input characters.
 extern fn disable_input_buffering() c_int;
 extern fn restore_input_buffering() void;
 extern fn check_key() bool;
@@ -88,16 +108,13 @@ const conditionFlags = enum(u16) {
     FL_NEG = (1 << 2), // (N)egative
 };
 
-// ---
-// That's all for hardware mocking!
-// ---
-
 // Traps
 //  *Trap routines* are routines for getting input from the keyboard and displaying strings to the console
 //  You can almost imagine these as an API for  the LC-3
 //  Each trap routine is assigned a _trap code_ which operates like an opcode
 //  When a trap routine is executed, we move the program counter to the routine's address and execute the procedure's instructions, then move the PC back to where it was before the routine
 //  Trap routines technically don't add any new functionality to our system, they just provide a convenient way to perform tasks
+// We will go through each trap code and implement it later on
 const TrapCodes = enum(u16) {
     GETC = 0x20, // Get char from keyboard, not echoed onto terminal
     OUT = 0x21, // Output a char
@@ -120,6 +137,14 @@ const MemoryMappedRegisters = enum(u16) {
     KBSR = 0xFE00, // Keyboard status
     KBDR = 0xFE02, // Keyboard data
 };
+
+// Memory utilities
+//  These are helper functions for reading and writing to memory
+//  We use these because we need to handle the special case of the keyboard status register
+//  When we read from the KBSR, we need to check if a key has been pressed
+//  If so, we need to read the key from the keyboard and store it in the KBDR
+//  We also need to update the KBSR to reflect that a key has been pressed
+//  This is a non-blocking operation, so we can continue execution without blocking
 
 fn memRead(addr: u16) !u16 {
     if (addr == KBSR) {
@@ -144,24 +169,24 @@ fn memWrite(address: u16, val: u16) void {
     memory[address] = val;
 }
 
-// A note on Assembly:
-//  At the base of our VM we want to transform assembly (very low level human readable code) into 16-bit binary instructions the vm can understand
-//  This transformer is called an *assembler*, and the resultant instructions are called *machine code*
-//  NOTE: An assembler and a compiler are not the same thing!
-//  An assembler simply encodes what the programmer has written in text into binary, replacing symbols with their binary representation and packing them into instructions.
+// Helper Functions
+// The VM uses several helper functions to support its operation:
 
-// Main loop
-//  The main loop of our VM is quite simple:
-//      1. Load an instruction from memory at the address in the PC register
-//      2. Increment the PC register
-//      3. Look at the opcode to detemine which type of instruction it should perform
-//      4. Perform the instruction using the params in the instruction
-//      Repeat!
-
+// swap16
+// Swaps the byte order of a 16-bit number (endianness conversion)
+// - Input: 16-bit integer
+// - Output: Same integer with bytes swapped
+// - Used when loading program images that may have different endianness
 fn swap16(x: u16) u16 {
     return (x << 8) | (x >> 8);
 }
 
+// handleCLArgs
+// Processes command line arguments to control VM behavior
+// - Handles `-h/--help` flag to display usage info
+// - Handles `-i/--image` flag to load program images
+// - Reads binary program file and loads it into VM memory
+// - Performs endianness conversion on loaded instructions
 fn handleCLArgs(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !void {
     while (args.next()) |arg| {
         if (eql(u8, arg, "-h") or eql(u8, arg, "--help")) {
@@ -220,6 +245,11 @@ fn handleCLArgs(args: *std.process.ArgIterator, allocator: std.mem.Allocator) !v
     }
 }
 
+// signExtend
+// Sign extends an N-bit number to 16 bits
+// - Used to preserve negative numbers when expanding bit width
+// - Takes original value and bit count
+// - Sets upper bits based on sign bit of original value
 // NOTE: Realistically this could just be a stdlib function
 fn signExtend(x: u16, comptime bitCount: u4) u16 {
     if (((x >> (bitCount - 1)) & 1) == 1) {
@@ -228,6 +258,11 @@ fn signExtend(x: u16, comptime bitCount: u4) u16 {
     return x;
 }
 
+// updateFlags
+// Updates condition flags based on a register value
+// - Sets appropriate flag (NEG/ZERO/POS) based on register contents
+// - Ensures exactly one condition flag is set at all times
+// - Used after operations that modify registers
 fn updateFlags(r: u16) void {
     if (registerStorage[r] == 0) {
         registerStorage[R_COND] = @intFromEnum(conditionFlags.FL_ZRO);
@@ -238,6 +273,21 @@ fn updateFlags(r: u16) void {
     }
 }
 
+// ---
+// A note on Assembly:
+//  At the base of our VM we want to transform assembly (very low level human readable code) into 16-bit binary instructions the vm can understand
+//  This transformer is called an *assembler*, and the resultant instructions are called *machine code*
+//  NOTE: An assembler and a compiler are not the same thing!
+//  An assembler simply encodes what the programmer has written in text into binary, replacing symbols with their binary representation and packing them into instructions.
+// ---
+
+// Main loop
+//  The main loop of our VM is quite simple:
+//      1. Load an instruction from memory at the address in the PC register
+//      2. Increment the PC register
+//      3. Look at the opcode to detemine which type of instruction it should perform
+//      4. Perform the instruction using the params in the instruction
+//      Repeat!
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
@@ -581,14 +631,6 @@ pub fn main() !void {
                 //      - opcode (4 bits, should be `1111`)
                 //      - unused (4 bits)
                 //      - trapvect8 (8 bits) - Index into trap vector table
-                //  Saves current PC in R7 before executing trap routine
-                //  Different trap codes perform different operations like:
-                //      - GETC: Read character from keyboard
-                //      - OUT: Output character
-                //      - PUTS: Output string
-                //      - IN: Input character with prompt
-                //      - PUTSP: Output byte string
-                //      - HALT: Halt program execution
 
                 // Store current PC in a register
                 registerStorage[R7] = registerStorage[R_PC];
@@ -599,6 +641,10 @@ pub fn main() !void {
                 // Switch on the trap code
                 switch (trapCode) {
                     .GETC => {
+                        // GETC (0x20): Get character from keyboard
+                        // Reads a single character from the keyboard.
+                        // The character is not echoed to the console.
+                        // The ASCII code for the character is stored in R0.
                         const stdin = std.io.getStdIn().reader();
                         const c = stdin.readByte() catch {
                             break error.InputError;
@@ -607,12 +653,19 @@ pub fn main() !void {
                         updateFlags(R0);
                     },
                     .OUT => {
+                        // OUT (0x21): Output a character
+                        // Writes a single character to the console.
+                        // The character is taken from R0 (only the least significant 8 bits are used).
                         const c: u8 = @truncate(registerStorage[R0]);
                         std.io.getStdOut().writer().writeByte(c) catch {
                             break error.OutputError;
                         };
                     },
                     .PUTS => {
+                        // PUTS (0x22): Output a word string
+                        // Writes a string of ASCII characters to the console.
+                        // The characters are taken from consecutive memory locations, one character per memory location,
+                        // starting with the address in R0 and continuing until a null terminator (0x0000) is encountered.
                         var address = registerStorage[R0];
                         var char: u16 = try memRead(address);
                         while (char != 0) {
@@ -624,6 +677,9 @@ pub fn main() !void {
                         }
                     },
                     .IN => {
+                        // IN (0x23): Input character with prompt
+                        // Prints a prompt on the screen and reads a single character from the keyboard.
+                        // The character is echoed to the console, and its ASCII code is stored in R0.
                         const stdout = std.io.getStdOut().writer();
                         const stdin = std.io.getStdIn().reader();
 
@@ -643,6 +699,11 @@ pub fn main() !void {
                         updateFlags(R0);
                     },
                     .PUTSP => {
+                        // PUTSP (0x24): Output a byte string
+                        // Writes a string of ASCII characters to the console.
+                        // The characters are stored in consecutive memory locations, two characters per memory location,
+                        // starting with the address in R0 and continuing until a null terminator (0x0000) is encountered.
+                        // The low byte of each memory location is the first character, and the high byte is the second.
                         const stdout = std.io.getStdOut().writer();
                         var address = registerStorage[R0];
                         var value: u16 = try memRead(address);
@@ -662,6 +723,9 @@ pub fn main() !void {
                         }
                     },
                     .HALT => {
+                        // HALT (0x25): Halt program execution
+                        // Halts execution of the program and displays a message on the console.
+                        // This is equivalent to executing a BREAK instruction in the simulator.
                         std.log.err("HALT", .{});
                         break :cpu;
                     },
