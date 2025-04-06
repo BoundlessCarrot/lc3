@@ -854,6 +854,7 @@ GETC (0x20)
 #### OUT
 
 OUT (0x21)
+
 - Writes a single character to the console.
 - The character is taken from R0 (only the least significant 8 bits are used).
 
@@ -869,6 +870,7 @@ OUT (0x21)
 #### PUTS
 
 PUTS (0x22)
+
 - Writes a string of ASCII characters to the console.
 - The characters are taken from consecutive memory locations, one character per memory location,
 - starting with the address in R0 and continuing until a null terminator (0x0000) is encountered.
